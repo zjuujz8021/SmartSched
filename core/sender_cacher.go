@@ -103,3 +103,7 @@ func (cacher *txSenderCacher) RecoverFromBlocks(signer types.Signer, blocks []*t
 	}
 	cacher.Recover(signer, txs)
 }
+
+func (cacher *txSenderCacher) Stop() {
+	close(cacher.tasks)
+}

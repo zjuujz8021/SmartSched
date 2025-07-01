@@ -48,3 +48,8 @@ help: Makefile
 	@echo " Choose a command run in go-ethereum:"
 	@sed -n 's/^#?//p' $< | column -t -s ':' |  sort | sed -e 's/^/ /'
 .PHONY: help
+
+bench:
+	$(GORUN) build/ci.go install ./cmd/benchmark
+	@echo "Done building."
+	@echo "Run \"$(GOBIN)/benchmark\" to launch benchmark."

@@ -35,6 +35,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/ethdb/pebble"
 	"github.com/ethereum/go-ethereum/internal/era"
 	"github.com/ethereum/go-ethereum/internal/flags"
 	"github.com/ethereum/go-ethereum/log"
@@ -45,6 +46,47 @@ import (
 )
 
 var (
+	TraceTxCmd = &cli.Command{
+		Action: TraceTx,
+		Name:   "tracetx",
+		Flags: flags.Merge([]cli.Flag{
+			TxHashFlag,
+			UseMVCCFlag,
+		}),
+	}
+	ReplayBlocksCmd = &cli.Command{
+		Action: ReplayBlocks,
+		Name:   "replayblocks",
+		Flags: flags.Merge([]cli.Flag{
+			ReplayStartFlag,
+			ReplayEndFlag,
+			IntervalFlag,
+			ConcurrencyFlag,
+			utils.ThreadsFlag,
+			UseTxLevelStateFlag,
+			UseOCCFlag,
+			UseSmartSchedFlag,
+			EnableTraceFlag,
+			OmitFailureFlag,
+			EnableCommutativeFlag,
+			UseGTRWSetsFlag,
+			CompareFlag,
+			utils.ExecStatsFileFlag,
+		}),
+	}
+	ExecuteBlocksCmd = &cli.Command{
+		Action: ExecuteBlocks,
+		Name:   "execute",
+		Flags: flags.Merge([]cli.Flag{
+			ReplayStartFlag,
+			ReplayEndFlag,
+			IntervalFlag,
+			ThreadsSliceFlag,
+			LogFilePrefixFlag,
+			utils.OnlySmartSchedsFlag,
+			utils.AllSchemesFlag,
+		}),
+	}
 	initCommand = &cli.Command{
 		Action:    initGenesis,
 		Name:      "init",
@@ -230,10 +272,24 @@ func initGenesis(ctx *cli.Context) error {
 		triedb := utils.MakeTrieDatabase(ctx, chaindb, ctx.Bool(utils.CachePreimagesFlag.Name), false, genesis.IsVerkle())
 		defer triedb.Close()
 
+		// SlimArchive
+		if name == "chaindata" {
+			core.PebbleDb, err = pebble.New(stack.ResolvePath("archive"), 0, 0, "", false, false)
+			if err != nil {
+				utils.Fatalf("Failed to open archive: %v", err)
+			}
+		}
+
 		_, hash, err := core.SetupGenesisBlockWithOverride(chaindb, triedb, genesis, &overrides)
 		if err != nil {
 			utils.Fatalf("Failed to write genesis block: %v", err)
 		}
+
+		// SlimArchive
+		if name == "chaindata" {
+			core.PebbleDb = nil
+		}
+
 		log.Info("Successfully wrote genesis state", "database", name, "hash", hash)
 	}
 	return nil

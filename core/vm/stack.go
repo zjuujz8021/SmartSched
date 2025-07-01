@@ -24,7 +24,7 @@ import (
 
 var stackPool = sync.Pool{
 	New: func() interface{} {
-		return &Stack{data: make([]uint256.Int, 0, 16)}
+		return &Stack{data: make([]uint256.Int, 0, 16), tag: make([]int, 0, 16)}
 	},
 }
 
@@ -33,6 +33,7 @@ var stackPool = sync.Pool{
 // initialised objects.
 type Stack struct {
 	data []uint256.Int
+	tag  []int
 }
 
 func newstack() *Stack {
@@ -41,6 +42,7 @@ func newstack() *Stack {
 
 func returnStack(s *Stack) {
 	s.data = s.data[:0]
+	s.tag = s.tag[:0]
 	stackPool.Put(s)
 }
 
@@ -49,14 +51,35 @@ func (st *Stack) Data() []uint256.Int {
 	return st.data
 }
 
-func (st *Stack) push(d *uint256.Int) {
+func (st *Stack) TagData() []int {
+	return st.tag
+}
+
+func (st *Stack) pushData(d *uint256.Int) {
 	// NOTE push limit (1024) is checked in baseCheck
 	st.data = append(st.data, *d)
+}
+
+func (st *Stack) pushTag(t int) {
+	// NOTE push limit (1024) is checked in baseCheck
+	st.tag = append(st.tag, t)
+}
+
+func (st *Stack) push(d *uint256.Int) {
+	// NOTE push limit (1024) is checked in baseCheck
+	st.pushData(d)
+	st.pushTag(0)
 }
 
 func (st *Stack) pop() (ret uint256.Int) {
 	ret = st.data[len(st.data)-1]
 	st.data = st.data[:len(st.data)-1]
+	return
+}
+
+func (st *Stack) popTag() (ret int) {
+	ret = st.tag[len(st.tag)-1]
+	st.tag = st.tag[:len(st.tag)-1]
 	return
 }
 
@@ -66,17 +89,28 @@ func (st *Stack) len() int {
 
 func (st *Stack) swap(n int) {
 	st.data[st.len()-n], st.data[st.len()-1] = st.data[st.len()-1], st.data[st.len()-n]
+	st.tag[st.len()-n], st.tag[st.len()-1] = st.tag[st.len()-1], st.tag[st.len()-n]
 }
 
 func (st *Stack) dup(n int) {
-	st.push(&st.data[st.len()-n])
+	len := st.len()
+	st.pushData(&st.data[len-n])
+	st.pushTag(st.tag[len-n])
 }
 
 func (st *Stack) peek() *uint256.Int {
 	return &st.data[st.len()-1]
 }
 
+func (st *Stack) peekTag() *int {
+	return &st.tag[len(st.tag)-1]
+}
+
 // Back returns the n'th item in stack
 func (st *Stack) Back(n int) *uint256.Int {
 	return &st.data[st.len()-n-1]
+}
+
+func (st *Stack) BackTag(n int) int {
+	return st.tag[st.len()-n-1]
 }

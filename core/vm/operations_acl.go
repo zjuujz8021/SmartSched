@@ -32,10 +32,12 @@ func makeGasSStoreFunc(clearingRefund uint64) gasFunc {
 		}
 		// Gas sentry honoured, do the actual gas calculation based on the stored value
 		var (
-			y, x    = stack.Back(1), stack.peek()
-			slot    = common.Hash(x.Bytes32())
-			current = evm.StateDB.GetState(contract.Address(), slot)
-			cost    = uint64(0)
+			y, x              = stack.Back(1), stack.peek()
+			yTag              = stack.BackTag(1)
+			slot              = common.Hash(x.Bytes32())
+			current           = evm.StateDB.GetState(contract.Address(), slot)
+			original          common.Hash
+			gas, refund, cost = uint64(0), uint64(0), uint64(0)
 		)
 		// Check slot presence in the access list
 		if addrPresent, slotPresent := evm.StateDB.SlotInAccessList(contract.Address(), slot); !slotPresent {
@@ -51,27 +53,40 @@ func makeGasSStoreFunc(clearingRefund uint64) gasFunc {
 		}
 		value := common.Hash(y.Bytes32())
 
+		if evm.Config.EnableRedo {
+			defer func() {
+				evm.RedoContext.OperationLogs.AppendSStoreGasV3Log(contract.Address(), slot,
+					original, current, value, yTag, gas, refund, clearingRefund)
+			}()
+		}
+
 		if current == value { // noop (1)
 			// EIP 2200 original clause:
 			//		return params.SloadGasEIP2200, nil
+			gas = params.WarmStorageReadCostEIP2929
 			return cost + params.WarmStorageReadCostEIP2929, nil // SLOAD_GAS
 		}
-		original := evm.StateDB.GetCommittedState(contract.Address(), x.Bytes32())
+		original = evm.StateDB.GetCommittedState(contract.Address(), x.Bytes32())
 		if original == current {
 			if original == (common.Hash{}) { // create slot (2.1.1)
+				gas = params.SstoreSetGasEIP2200
 				return cost + params.SstoreSetGasEIP2200, nil
 			}
 			if value == (common.Hash{}) { // delete slot (2.1.2b)
+				refund = clearingRefund
 				evm.StateDB.AddRefund(clearingRefund)
 			}
 			// EIP-2200 original clause:
 			//		return params.SstoreResetGasEIP2200, nil // write existing slot (2.1.2)
+			gas = (params.SstoreResetGasEIP2200 - params.ColdSloadCostEIP2929)
 			return cost + (params.SstoreResetGasEIP2200 - params.ColdSloadCostEIP2929), nil // write existing slot (2.1.2)
 		}
 		if original != (common.Hash{}) {
 			if current == (common.Hash{}) { // recreate slot (2.2.1.1)
+				refund += ^clearingRefund + 1
 				evm.StateDB.SubRefund(clearingRefund)
 			} else if value == (common.Hash{}) { // delete slot (2.2.1.2)
+				refund += clearingRefund
 				evm.StateDB.AddRefund(clearingRefund)
 			}
 		}
@@ -79,6 +94,7 @@ func makeGasSStoreFunc(clearingRefund uint64) gasFunc {
 			if original == (common.Hash{}) { // reset to original inexistent slot (2.2.2.1)
 				// EIP 2200 Original clause:
 				//evm.StateDB.AddRefund(params.SstoreSetGasEIP2200 - params.SloadGasEIP2200)
+				refund += params.SstoreSetGasEIP2200 - params.WarmStorageReadCostEIP2929
 				evm.StateDB.AddRefund(params.SstoreSetGasEIP2200 - params.WarmStorageReadCostEIP2929)
 			} else { // reset to original existing slot (2.2.2.2)
 				// EIP 2200 Original clause:
@@ -86,11 +102,13 @@ func makeGasSStoreFunc(clearingRefund uint64) gasFunc {
 				// - SSTORE_RESET_GAS redefined as (5000 - COLD_SLOAD_COST)
 				// - SLOAD_GAS redefined as WARM_STORAGE_READ_COST
 				// Final: (5000 - COLD_SLOAD_COST) - WARM_STORAGE_READ_COST
+				refund += (params.SstoreResetGasEIP2200 - params.ColdSloadCostEIP2929) - params.WarmStorageReadCostEIP2929
 				evm.StateDB.AddRefund((params.SstoreResetGasEIP2200 - params.ColdSloadCostEIP2929) - params.WarmStorageReadCostEIP2929)
 			}
 		}
 		// EIP-2200 original clause:
 		//return params.SloadGasEIP2200, nil // dirty update (2.2)
+		gas = params.WarmStorageReadCostEIP2929
 		return cost + params.WarmStorageReadCostEIP2929, nil // dirty update (2.2)
 	}
 }
@@ -237,8 +255,17 @@ func makeSelfdestructGasFn(refundsEnabled bool) gasFunc {
 			gas = params.ColdAccountAccessCostEIP2929
 		}
 		// if empty and transfers value
-		if evm.StateDB.Empty(address) && evm.StateDB.GetBalance(contract.Address()).Sign() != 0 {
-			gas += params.CreateBySelfdestructGas
+		if evm.StateDB.Empty(address) {
+			if evm.StateDB.GetBalance(contract.Address()).Sign() != 0 {
+				gas += params.CreateBySelfdestructGas
+				if evm.Config.EnableRedo {
+					evm.RedoContext.AppendAssertBalanceNonZeroLog(contract.Address())
+				}
+			} else {
+				if evm.Config.EnableRedo {
+					evm.RedoContext.AppendAssertBalanceZeroLog(contract.Address())
+				}
+			}
 		}
 		if refundsEnabled && !evm.StateDB.HasSelfDestructed(contract.Address()) {
 			evm.StateDB.AddRefund(params.SelfdestructRefundGas)

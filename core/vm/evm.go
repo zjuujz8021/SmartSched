@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
@@ -85,6 +86,7 @@ type TxContext struct {
 	GasPrice   *big.Int       // Provides information for GASPRICE (and is used to zero the basefee if NoBaseFee is set)
 	BlobHashes []common.Hash  // Provides information for BLOBHASH
 	BlobFeeCap *big.Int       // Is used to zero the blobbasefee if NoBaseFee is set
+	TxIndex    int
 }
 
 // EVM is the Ethereum Virtual Machine base object and provides
@@ -121,6 +123,8 @@ type EVM struct {
 	// available gas is calculated in gasCall* according to the 63/64 rule and later
 	// applied in opCall*.
 	callGasTemp uint64
+
+	RedoContext *state.RedoContext
 }
 
 // NewEVM returns a new EVM. The returned EVM is not thread safe and should
@@ -149,11 +153,19 @@ func NewEVM(blockCtx BlockContext, txCtx TxContext, statedb StateDB, chainConfig
 	return evm
 }
 
+func (evm *EVM) SetSSTORECallback(cb func(tx int, pc uint64, addr common.Address, key, value common.Hash)) {
+	evm.interpreter.sstoreCb = cb
+}
+
 // Reset resets the EVM with a new transaction context.Reset
 // This is not threadsafe and should only be done very cautiously.
 func (evm *EVM) Reset(txCtx TxContext, statedb StateDB) {
 	evm.TxContext = txCtx
 	evm.StateDB = statedb
+}
+
+func (evm *EVM) ResetRedoCtx(ctx *state.RedoContext) {
+	evm.RedoContext = ctx
 }
 
 // Cancel cancels any running EVM operation. This may be called concurrently and
@@ -183,6 +195,9 @@ func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas 
 	}
 	// Fail if we're trying to transfer more than the available balance
 	if !value.IsZero() && !evm.Context.CanTransfer(evm.StateDB, caller.Address(), value) {
+		if evm.Config.EnableRedo {
+			evm.RedoContext.AppendAssertBalanceLessLog(caller.Address(), value)
+		}
 		return nil, gas, ErrInsufficientBalance
 	}
 	snapshot := evm.StateDB.Snapshot()
@@ -204,8 +219,14 @@ func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas 
 			return nil, gas, nil
 		}
 		evm.StateDB.CreateAccount(addr)
+		if evm.Config.EnableRedo {
+			evm.RedoContext.OperationLogs.CreateAccount(addr)
+		}
 	}
 	evm.Context.Transfer(evm.StateDB, caller.Address(), addr, value)
+	if evm.Config.EnableRedo {
+		evm.RedoContext.AppendTransferBalanceLog(caller.Address(), addr, value)
+	}
 
 	// Capture the tracer start/end events in debug mode
 	if debug {
@@ -273,7 +294,13 @@ func (evm *EVM) CallCode(caller ContractRef, addr common.Address, input []byte, 
 	// if caller doesn't have enough balance, it would be an error to allow
 	// over-charging itself. So the check here is necessary.
 	if !evm.Context.CanTransfer(evm.StateDB, caller.Address(), value) {
+		if evm.Config.EnableRedo {
+			evm.RedoContext.AppendAssertBalanceLessLog(caller.Address(), value)
+		}
 		return nil, gas, ErrInsufficientBalance
+	}
+	if evm.Config.EnableRedo {
+		evm.RedoContext.AppendAssertEnoughBalanceLog(caller.Address(), value)
 	}
 	var snapshot = evm.StateDB.Snapshot()
 
@@ -371,6 +398,9 @@ func (evm *EVM) StaticCall(caller ContractRef, addr common.Address, input []byte
 	// but is the correct thing to do and matters on other networks, in tests, and potential
 	// future scenarios
 	evm.StateDB.AddBalance(addr, new(uint256.Int))
+	if evm.Config.EnableRedo {
+		evm.RedoContext.AppendAddBalanceLog(addr, new(uint256.Int))
+	}
 
 	// Invoke tracer hooks that signal entering/exiting a call frame
 	if evm.Config.Tracer != nil {
@@ -426,6 +456,9 @@ func (evm *EVM) create(caller ContractRef, codeAndHash *codeAndHash, gas uint64,
 		return nil, common.Address{}, gas, ErrDepth
 	}
 	if !evm.Context.CanTransfer(evm.StateDB, caller.Address(), value) {
+		if evm.Config.EnableRedo {
+			evm.RedoContext.AppendAssertBalanceLessLog(caller.Address(), value)
+		}
 		return nil, common.Address{}, gas, ErrInsufficientBalance
 	}
 	nonce := evm.StateDB.GetNonce(caller.Address())
@@ -433,6 +466,9 @@ func (evm *EVM) create(caller ContractRef, codeAndHash *codeAndHash, gas uint64,
 		return nil, common.Address{}, gas, ErrNonceUintOverflow
 	}
 	evm.StateDB.SetNonce(caller.Address(), nonce+1)
+	if evm.Config.EnableRedo {
+		evm.RedoContext.AppendNonceIncLog(caller.Address())
+	}
 	// We add this to the access list _before_ taking a snapshot. Even if the creation fails,
 	// the access-list change should not be rolled back
 	if evm.chainRules.IsBerlin {
@@ -440,16 +476,33 @@ func (evm *EVM) create(caller ContractRef, codeAndHash *codeAndHash, gas uint64,
 	}
 	// Ensure there's no existing contract already at the designated address
 	contractHash := evm.StateDB.GetCodeHash(address)
-	if evm.StateDB.GetNonce(address) != 0 || (contractHash != (common.Hash{}) && contractHash != types.EmptyCodeHash) {
+	addrNonce := evm.StateDB.GetNonce(address)
+	if evm.Config.EnableRedo {
+		if addrNonce == 0 {
+			evm.RedoContext.AppendNonceEqualLog(address, 0)
+		} else {
+			evm.RedoContext.AppendNonceNotEqualLog(address, 0)
+		}
+	}
+	if addrNonce != 0 || (contractHash != (common.Hash{}) && contractHash != types.EmptyCodeHash) {
 		return nil, common.Address{}, 0, ErrContractAddressCollision
 	}
 	// Create a new account on the state
 	snapshot := evm.StateDB.Snapshot()
 	evm.StateDB.CreateAccount(address)
+	if evm.Config.EnableRedo {
+		evm.RedoContext.OperationLogs.CreateAccount(address)
+	}
 	if evm.chainRules.IsEIP158 {
 		evm.StateDB.SetNonce(address, 1)
+		if evm.Config.EnableRedo {
+			evm.RedoContext.AppendNonceIncLog(address)
+		}
 	}
 	evm.Context.Transfer(evm.StateDB, caller.Address(), address, value)
+	if evm.Config.EnableRedo {
+		evm.RedoContext.AppendTransferBalanceLog(caller.Address(), address, value)
+	}
 
 	// Initialise a new contract and set the code that is to be used by the EVM.
 	// The contract is a scoped environment for this execution context only.
@@ -511,7 +564,11 @@ func (evm *EVM) create(caller ContractRef, codeAndHash *codeAndHash, gas uint64,
 
 // Create creates a new contract using code as deployment code.
 func (evm *EVM) Create(caller ContractRef, code []byte, gas uint64, value *uint256.Int) (ret []byte, contractAddr common.Address, leftOverGas uint64, err error) {
-	contractAddr = crypto.CreateAddress(caller.Address(), evm.StateDB.GetNonce(caller.Address()))
+	nonce := evm.StateDB.GetNonce(caller.Address())
+	if evm.Config.EnableRedo {
+		evm.RedoContext.AppendNonceEqualLog(caller.Address(), nonce)
+	}
+	contractAddr = crypto.CreateAddress(caller.Address(), nonce)
 	return evm.create(caller, &codeAndHash{code: code}, gas, value, contractAddr, CREATE)
 }
 

@@ -45,6 +45,7 @@ import (
 	"github.com/ethereum/go-ethereum/eth/protocols/eth"
 	"github.com/ethereum/go-ethereum/eth/protocols/snap"
 	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/ethdb/pebble"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/internal/ethapi"
 	"github.com/ethereum/go-ethereum/internal/shutdowncheck"
@@ -213,6 +214,18 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	if config.OverrideVerkle != nil {
 		overrides.OverrideVerkle = config.OverrideVerkle
 	}
+
+	// SlimArchive
+	var archiveDb *pebble.Database
+	if archiveDb, err = pebble.New(stack.ResolvePath("archive"), config.DatabaseCache, config.DatabaseHandles, "", false, false); err != nil {
+		return nil, err
+	}
+	core.PebbleDb = archiveDb
+
+	if err := eth.blockchain.SetSlimArchiveDb(archiveDb); err != nil {
+		return nil, err
+	}
+
 	eth.blockchain, err = core.NewBlockChain(chainDb, cacheConfig, config.Genesis, &overrides, eth.engine, vmConfig, eth.shouldPreserve, &config.TransactionHistory)
 	if err != nil {
 		return nil, err

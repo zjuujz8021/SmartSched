@@ -204,6 +204,9 @@ func init() {
 	// Initialize the CLI app and start Geth
 	app.Action = geth
 	app.Commands = []*cli.Command{
+		TraceTxCmd,
+		ReplayBlocksCmd,
+		ExecuteBlocksCmd,
 		// See chaincmd.go:
 		initCommand,
 		importCommand,

@@ -23,9 +23,9 @@ import (
 	"io"
 	"math/big"
 	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -40,6 +40,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/ethdb/pebble"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/ethereum/go-ethereum/internal/syncx"
 	"github.com/ethereum/go-ethereum/internal/version"
@@ -259,6 +260,8 @@ type BlockChain struct {
 	processor  Processor // Block transaction processor interface
 	forker     *ForkChoice
 	vmConfig   vm.Config
+
+	archiveDb *pebble.Database
 }
 
 // NewBlockChain returns a fully initialised block chain using information
@@ -278,13 +281,13 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, genesis *Genesis
 	if _, ok := genesisErr.(*params.ConfigCompatError); genesisErr != nil && !ok {
 		return nil, genesisErr
 	}
-	log.Info("")
-	log.Info(strings.Repeat("-", 153))
-	for _, line := range strings.Split(chainConfig.Description(), "\n") {
-		log.Info(line)
-	}
-	log.Info(strings.Repeat("-", 153))
-	log.Info("")
+	// log.Info("")
+	// log.Info(strings.Repeat("-", 153))
+	// for _, line := range strings.Split(chainConfig.Description(), "\n") {
+	// 	log.Info(line)
+	// }
+	// log.Info(strings.Repeat("-", 153))
+	// log.Info("")
 
 	bc := &BlockChain{
 		chainConfig:   chainConfig,
@@ -1032,6 +1035,10 @@ func (bc *BlockChain) Stop() {
 	// Close the trie database, release all the held resources as the last step.
 	if err := bc.triedb.Close(); err != nil {
 		log.Error("Failed to close trie database", "err", err)
+	}
+
+	if err := bc.archiveDb.Close(); err != nil {
+		log.Error("Fail to close archive db", "err", err.Error())
 	}
 	log.Info("Blockchain stopped")
 }
@@ -2458,4 +2465,35 @@ func (bc *BlockChain) SetTrieFlushInterval(interval time.Duration) {
 // GetTrieFlushInterval gets the in-memory tries flushAlloc interval
 func (bc *BlockChain) GetTrieFlushInterval() time.Duration {
 	return time.Duration(bc.flushInterval.Load())
+}
+
+func (bc *BlockChain) ChainDB() ethdb.Database {
+	return bc.db
+}
+
+func (bc *BlockChain) SetSlimArchiveDb(archiveDb *pebble.Database) (err error) {
+	bc.archiveDb = archiveDb
+	return
+}
+
+func (bc *BlockChain) SendKillSignal() {
+	if err := syscall.Kill(syscall.Getpid(), syscall.SIGINT); err != nil {
+		log.Warn("Kill process failed!!!", "err", err.Error())
+	}
+}
+
+func (bc *BlockChain) GetConfirmedStateDB(number uint64, index int) *state.StateDB {
+	bsTrie := state.NewSlimArchiveTrie(number, index, bc.archiveDb)
+	statedb, _ := state.New(common.Hash{}, bsTrie, nil)
+	return statedb
+}
+
+func (bc *BlockChain) GetStateDB(number uint64, index int) (*state.StateDB, error) {
+	bsTrie := state.NewSlimArchiveTrie(number, index, bc.archiveDb)
+	statedb, _ := state.New(common.Hash{}, bsTrie, nil)
+	return statedb, nil
+}
+
+func (bc *BlockChain) GetSlimArchiveTrie(number uint64, index int) *state.SlimArchiveTrie {
+	return state.NewSlimArchiveTrie(number, index, bc.archiveDb)
 }

@@ -257,8 +257,15 @@ func (st *StateTransition) buyGas() error {
 	if overflow {
 		return fmt.Errorf("%w: address %v required balance exceeds 256 bits", ErrInsufficientFunds, st.msg.From.Hex())
 	}
-	if have, want := st.state.GetBalance(st.msg.From), balanceCheckU256; have.Cmp(want) < 0 {
-		return fmt.Errorf("%w: address %v have %v want %v", ErrInsufficientFunds, st.msg.From.Hex(), have, want)
+	// if have, want := st.state.GetBalance(st.msg.From), balanceCheckU256; have.Cmp(want) < 0 {
+	// 	return fmt.Errorf("%w: address %v have %v want %v", ErrInsufficientFunds, st.msg.From.Hex(), have, want)
+	// }
+	// use can transfer instead of get balance
+	if !st.evm.Context.CanTransfer(st.state, st.msg.From, balanceCheckU256) {
+		return fmt.Errorf("%w: address %v have %v want %v", ErrInsufficientFunds, st.msg.From.Hex(), st.state.GetBalance(st.msg.From), balanceCheckU256)
+	}
+	if st.evm.Config.EnableRedo {
+		st.evm.RedoContext.AppendAssertEnoughBalanceLog(st.msg.From, balanceCheckU256)
 	}
 	if err := st.gp.SubGas(st.msg.GasLimit); err != nil {
 		return err
@@ -268,6 +275,9 @@ func (st *StateTransition) buyGas() error {
 	st.initialGas = st.msg.GasLimit
 	mgvalU256, _ := uint256.FromBig(mgval)
 	st.state.SubBalance(st.msg.From, mgvalU256)
+	if st.evm.Config.EnableRedo {
+		st.evm.RedoContext.AppendSubBalanceLog(st.msg.From, mgvalU256)
+	}
 	return nil
 }
 
@@ -286,6 +296,9 @@ func (st *StateTransition) preCheck() error {
 		} else if stNonce+1 < stNonce {
 			return fmt.Errorf("%w: address %v, nonce: %d", ErrNonceMax,
 				msg.From.Hex(), stNonce)
+		}
+		if st.evm.Config.EnableRedo {
+			st.evm.RedoContext.AppendNonceEqualLog(st.msg.From, stNonce)
 		}
 		// Make sure the sender is an EOA
 		codeHash := st.state.GetCodeHash(msg.From)
@@ -418,6 +431,10 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 		return nil, fmt.Errorf("%w: code size %v limit %v", ErrMaxInitCodeSizeExceeded, len(msg.Data), params.MaxInitCodeSize)
 	}
 
+	if st.evm.Config.EnableRedo {
+		st.evm.RedoContext.AppendAssertEnoughBalanceLog(msg.From, value)
+	}
+
 	// Execute the preparatory steps for state transition which includes:
 	// - prepare accessList(post-berlin)
 	// - reset transient storage(eip 1153)
@@ -431,7 +448,12 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 		ret, _, st.gasRemaining, vmerr = st.evm.Create(sender, msg.Data, st.gasRemaining, value)
 	} else {
 		// Increment the nonce for the next transaction
-		st.state.SetNonce(msg.From, st.state.GetNonce(sender.Address())+1)
+		if !msg.SkipAccountChecks {
+			st.state.SetNonce(msg.From, st.state.GetNonce(sender.Address())+1)
+			if st.evm.Config.EnableRedo {
+				st.evm.RedoContext.AppendNonceIncLog(sender.Address())
+			}
+		}
 		ret, st.gasRemaining, vmerr = st.evm.Call(sender, st.to(), msg.Data, st.gasRemaining, value)
 	}
 
@@ -449,14 +471,19 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 	}
 	effectiveTipU256, _ := uint256.FromBig(effectiveTip)
 
-	if st.evm.Config.NoBaseFee && msg.GasFeeCap.Sign() == 0 && msg.GasTipCap.Sign() == 0 {
-		// Skip fee payment when NoBaseFee is set and the fee fields
-		// are 0. This avoids a negative effectiveTip being applied to
-		// the coinbase when simulating calls.
-	} else {
-		fee := new(uint256.Int).SetUint64(st.gasUsed())
-		fee.Mul(fee, effectiveTipU256)
-		st.state.AddBalance(st.evm.Context.Coinbase, fee)
+	if !msg.SkipAccountChecks {
+		if st.evm.Config.NoBaseFee && msg.GasFeeCap.Sign() == 0 && msg.GasTipCap.Sign() == 0 {
+			// Skip fee payment when NoBaseFee is set and the fee fields
+			// are 0. This avoids a negative effectiveTip being applied to
+			// the coinbase when simulating calls.
+		} else {
+			fee := new(uint256.Int).SetUint64(st.gasUsed())
+			fee.Mul(fee, effectiveTipU256)
+			st.state.AddBalance(st.evm.Context.Coinbase, fee)
+			if st.evm.Config.EnableRedo {
+				st.evm.RedoContext.AppendAddBalanceLog(st.evm.Context.Coinbase, fee)
+			}
+		}
 	}
 
 	return &ExecutionResult{
@@ -479,6 +506,9 @@ func (st *StateTransition) refundGas(refundQuotient uint64) uint64 {
 	remaining := uint256.NewInt(st.gasRemaining)
 	remaining = remaining.Mul(remaining, uint256.MustFromBig(st.msg.GasPrice))
 	st.state.AddBalance(st.msg.From, remaining)
+	if st.evm.Config.EnableRedo {
+		st.evm.RedoContext.AppendAddBalanceLog(st.msg.From, remaining)
+	}
 
 	// Also return remaining gas to the block gas counter so it is
 	// available for the next transaction.

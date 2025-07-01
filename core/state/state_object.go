@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -71,6 +72,8 @@ type stateObject struct {
 	trie Trie // storage trie, which becomes non-nil on first access
 	code Code // contract bytecode, which gets set when code is loaded
 
+	originMu sync.RWMutex
+
 	originStorage  Storage // Storage cache of original entries to dedup rewrites
 	pendingStorage Storage // Storage entries that need to be flushed to disk, at the end of an entire block
 	dirtyStorage   Storage // Storage entries that have been modified in the current transaction execution, reset for every transaction
@@ -89,6 +92,8 @@ type stateObject struct {
 
 	// Flag whether the object was created in the current transaction
 	created bool
+
+	trieonce sync.Once
 }
 
 // empty returns whether the account is considered empty.
@@ -142,21 +147,25 @@ func (s *stateObject) touch() {
 // if it's not loaded previously. An error will be returned if trie can't
 // be loaded.
 func (s *stateObject) getTrie() (Trie, error) {
-	if s.trie == nil {
-		// Try fetching from prefetcher first
-		if s.data.Root != types.EmptyRootHash && s.db.prefetcher != nil {
-			// When the miner is creating the pending state, there is no prefetcher
-			s.trie = s.db.prefetcher.trie(s.addrHash, s.data.Root)
-		}
+	var err2 error
+	s.trieonce.Do(func() {
 		if s.trie == nil {
-			tr, err := s.db.db.OpenStorageTrie(s.db.originalRoot, s.address, s.data.Root, s.db.trie)
-			if err != nil {
-				return nil, err
+			// Try fetching from prefetcher first
+			if s.data.Root != types.EmptyRootHash && s.db.prefetcher != nil {
+				// When the miner is creating the pending state, there is no prefetcher
+				s.trie = s.db.prefetcher.trie(s.addrHash, s.data.Root)
 			}
-			s.trie = tr
+			if s.trie == nil {
+				tr, err := s.db.db.OpenStorageTrie(s.db.originalRoot, s.address, s.data.Root, s.db.trie)
+				if err != nil {
+					err2 = err
+					return
+				}
+				s.trie = tr
+			}
 		}
-	}
-	return s.trie, nil
+	})
+	return s.trie, err2
 }
 
 // GetState retrieves a value from the account storage trie.
@@ -170,15 +179,32 @@ func (s *stateObject) GetState(key common.Hash) common.Hash {
 	return s.GetCommittedState(key)
 }
 
+func (s *stateObject) GetCommittedStateFromTrie(key common.Hash) common.Hash {
+	tr, err := s.getTrie()
+	if err != nil {
+		s.db.setError(err)
+		return common.Hash{}
+	}
+	val, err := tr.GetStorage(s.address, key.Bytes())
+	if err != nil {
+		s.db.setError(err)
+		return common.Hash{}
+	}
+	return common.BytesToHash(val)
+}
+
 // GetCommittedState retrieves a value from the committed account storage trie.
 func (s *stateObject) GetCommittedState(key common.Hash) common.Hash {
 	// If we have a pending write or clean cached, return that
 	if value, pending := s.pendingStorage[key]; pending {
 		return value
 	}
+	s.originMu.RLock()
 	if value, cached := s.originStorage[key]; cached {
+		s.originMu.RUnlock()
 		return value
 	}
+	s.originMu.RUnlock()
 	// If the object was destructed in *this* block (and potentially resurrected),
 	// the storage has been cleared out, and we should *not* consult the previous
 	// database about any storage values. The only possible alternatives are:
@@ -226,7 +252,9 @@ func (s *stateObject) GetCommittedState(key common.Hash) common.Hash {
 		}
 		value.SetBytes(val)
 	}
+	s.originMu.Lock()
 	s.originStorage[key] = value
+	s.originMu.Unlock()
 	return value
 }
 

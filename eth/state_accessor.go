@@ -49,14 +49,20 @@ func (eth *Ethereum) hashState(ctx context.Context, block *types.Block, reexec u
 	// The state is only for reading purposes, check the state presence in
 	// live database.
 	if readOnly {
-		// The state is available in live database, create a reference
-		// on top to prevent garbage collection and return a release
-		// function to deref it.
-		if statedb, err = eth.blockchain.StateAt(block.Root()); err == nil {
-			eth.blockchain.TrieDB().Reference(block.Root(), common.Hash{})
-			return statedb, func() {
-				eth.blockchain.TrieDB().Dereference(block.Root())
-			}, nil
+		// SlimArchive
+		if eth.blockchain.StateCache() != nil {
+			// The state is available in live database, create a reference
+			// on top to prevent garbage collection and return a release
+			// function to deref it.
+			if statedb, err = eth.blockchain.StateAt(block.Root()); err == nil {
+				eth.blockchain.TrieDB().Reference(block.Root(), common.Hash{})
+				return statedb, func() {
+					eth.blockchain.TrieDB().Dereference(block.Root())
+				}, nil
+			}
+		}
+		if statedb, err = eth.blockchain.GetStateDB(block.NumberU64()+1, 0); err == nil {
+			return statedb, func() {}, nil
 		}
 	}
 	// The state is both for reading and writing, or it's unavailable in disk,
@@ -176,11 +182,18 @@ func (eth *Ethereum) hashState(ctx context.Context, block *types.Block, reexec u
 }
 
 func (eth *Ethereum) pathState(block *types.Block) (*state.StateDB, func(), error) {
-	// Check if the requested state is available in the live chain.
-	statedb, err := eth.blockchain.StateAt(block.Root())
-	if err == nil {
-		return statedb, noopReleaser, nil
+	// SlimArchive
+	if eth.blockchain.StateCache() != nil {
+		// Check if the requested state is available in the live chain.
+		statedb, err := eth.blockchain.StateAt(block.Root())
+		if err == nil {
+			return statedb, noopReleaser, nil
+		}
 	}
+	if statedb, err := eth.blockchain.GetStateDB(block.NumberU64()+1, 0); err == nil {
+		return statedb, func() {}, nil
+	}
+
 	// TODO historic state is not supported in path-based scheme.
 	// Fully archive node in pbss will be implemented by relying
 	// on state history, but needs more work on top.

@@ -97,9 +97,23 @@ var (
 
 func gasSStore(evm *EVM, contract *Contract, stack *Stack, mem *Memory, memorySize uint64) (uint64, error) {
 	var (
-		y, x    = stack.Back(1), stack.Back(0)
-		current = evm.StateDB.GetState(contract.Address(), x.Bytes32())
+		y, x        = stack.Back(1), stack.Back(0)
+		yTag        = stack.BackTag(1)
+		current     = evm.StateDB.GetState(contract.Address(), x.Bytes32())
+		original    common.Hash
+		gas, refund = uint64(0), uint64(0)
 	)
+	if evm.Config.EnableRedo {
+		defer func() {
+			if evm.chainRules.IsPetersburg || !evm.chainRules.IsConstantinople {
+				evm.RedoContext.OperationLogs.AppendSStoreGasV1Log(
+					contract.Address(), x.Bytes32(), current, *y, yTag, gas, refund)
+			} else {
+				evm.RedoContext.OperationLogs.AppendSStoreGasV2Log(
+					contract.Address(), x.Bytes32(), original, current, common.Hash(y.Bytes32()), yTag, gas, refund)
+			}
+		}()
+	}
 	// The legacy gas metering only takes into consideration the current state
 	// Legacy rules should be applied if we are in Petersburg (removal of EIP-1283)
 	// OR Constantinople is not active
@@ -111,11 +125,14 @@ func gasSStore(evm *EVM, contract *Contract, stack *Stack, mem *Memory, memorySi
 		// 3. From a non-zero to a non-zero                         (CHANGE)
 		switch {
 		case current == (common.Hash{}) && y.Sign() != 0: // 0 => non 0
+			gas = params.SstoreSetGas
 			return params.SstoreSetGas, nil
 		case current != (common.Hash{}) && y.Sign() == 0: // non 0 => 0
+			gas, refund = params.SstoreClearGas, params.SstoreRefundGas
 			evm.StateDB.AddRefund(params.SstoreRefundGas)
 			return params.SstoreClearGas, nil
 		default: // non 0 => non 0 (or 0 => 0)
+			gas = params.SstoreResetGas
 			return params.SstoreResetGas, nil
 		}
 	}
@@ -136,32 +153,41 @@ func gasSStore(evm *EVM, contract *Contract, stack *Stack, mem *Memory, memorySi
 	//			(2.2.2.2.) Otherwise, add 4800 gas to refund counter.
 	value := common.Hash(y.Bytes32())
 	if current == value { // noop (1)
+		gas = params.NetSstoreNoopGas
 		return params.NetSstoreNoopGas, nil
 	}
-	original := evm.StateDB.GetCommittedState(contract.Address(), x.Bytes32())
+	original = evm.StateDB.GetCommittedState(contract.Address(), x.Bytes32())
 	if original == current {
 		if original == (common.Hash{}) { // create slot (2.1.1)
+			gas = params.NetSstoreInitGas
 			return params.NetSstoreInitGas, nil
 		}
 		if value == (common.Hash{}) { // delete slot (2.1.2b)
+			refund += params.NetSstoreClearRefund
 			evm.StateDB.AddRefund(params.NetSstoreClearRefund)
 		}
+		gas = params.NetSstoreCleanGas
 		return params.NetSstoreCleanGas, nil // write existing slot (2.1.2)
 	}
 	if original != (common.Hash{}) {
 		if current == (common.Hash{}) { // recreate slot (2.2.1.1)
+			refund += ^params.NetSstoreClearRefund + 1
 			evm.StateDB.SubRefund(params.NetSstoreClearRefund)
 		} else if value == (common.Hash{}) { // delete slot (2.2.1.2)
+			refund += params.NetSstoreClearRefund
 			evm.StateDB.AddRefund(params.NetSstoreClearRefund)
 		}
 	}
 	if original == value {
 		if original == (common.Hash{}) { // reset to original inexistent slot (2.2.2.1)
+			refund += params.NetSstoreResetClearRefund
 			evm.StateDB.AddRefund(params.NetSstoreResetClearRefund)
 		} else { // reset to original existing slot (2.2.2.2)
+			refund += params.NetSstoreResetRefund
 			evm.StateDB.AddRefund(params.NetSstoreResetRefund)
 		}
 	}
+	gas = params.NetSstoreDirtyGas
 	return params.NetSstoreDirtyGas, nil
 }
 
@@ -187,38 +213,56 @@ func gasSStoreEIP2200(evm *EVM, contract *Contract, stack *Stack, mem *Memory, m
 	}
 	// Gas sentry honoured, do the actual gas calculation based on the stored value
 	var (
-		y, x    = stack.Back(1), stack.Back(0)
-		current = evm.StateDB.GetState(contract.Address(), x.Bytes32())
+		y, x        = stack.Back(1), stack.Back(0)
+		yTag        = stack.BackTag(1)
+		current     = evm.StateDB.GetState(contract.Address(), x.Bytes32())
+		original    = evm.StateDB.GetCommittedState(contract.Address(), x.Bytes32())
+		gas, refund = uint64(0), uint64(0)
 	)
 	value := common.Hash(y.Bytes32())
+	if evm.Config.EnableRedo {
+		defer func() {
+			evm.RedoContext.OperationLogs.AppendSStoreGasV4Log(
+				contract.Address(), x.Bytes32(), original, current, value, yTag, gas, refund)
+		}()
+	}
 
 	if current == value { // noop (1)
+		gas = params.SloadGasEIP2200
 		return params.SloadGasEIP2200, nil
 	}
-	original := evm.StateDB.GetCommittedState(contract.Address(), x.Bytes32())
+	// original = evm.StateDB.GetCommittedState(contract.Address(), x.Bytes32())
 	if original == current {
 		if original == (common.Hash{}) { // create slot (2.1.1)
+			gas = params.SstoreSetGasEIP2200
 			return params.SstoreSetGasEIP2200, nil
 		}
 		if value == (common.Hash{}) { // delete slot (2.1.2b)
+			refund = params.SstoreClearsScheduleRefundEIP2200
 			evm.StateDB.AddRefund(params.SstoreClearsScheduleRefundEIP2200)
 		}
+		gas = params.SstoreResetGasEIP2200
 		return params.SstoreResetGasEIP2200, nil // write existing slot (2.1.2)
 	}
 	if original != (common.Hash{}) {
 		if current == (common.Hash{}) { // recreate slot (2.2.1.1)
+			refund = ^params.SstoreClearsScheduleRefundEIP2200 + 1
 			evm.StateDB.SubRefund(params.SstoreClearsScheduleRefundEIP2200)
 		} else if value == (common.Hash{}) { // delete slot (2.2.1.2)
+			refund = params.SstoreClearsScheduleRefundEIP2200
 			evm.StateDB.AddRefund(params.SstoreClearsScheduleRefundEIP2200)
 		}
 	}
 	if original == value {
 		if original == (common.Hash{}) { // reset to original inexistent slot (2.2.2.1)
+			refund += params.SstoreSetGasEIP2200 - params.SloadGasEIP2200
 			evm.StateDB.AddRefund(params.SstoreSetGasEIP2200 - params.SloadGasEIP2200)
 		} else { // reset to original existing slot (2.2.2.2)
+			refund += params.SstoreResetGasEIP2200 - params.SloadGasEIP2200
 			evm.StateDB.AddRefund(params.SstoreResetGasEIP2200 - params.SloadGasEIP2200)
 		}
 	}
+	gas = params.SloadGasEIP2200
 	return params.SloadGasEIP2200, nil // dirty update (2.2)
 }
 
@@ -464,8 +508,17 @@ func gasSelfdestruct(evm *EVM, contract *Contract, stack *Stack, mem *Memory, me
 
 		if evm.chainRules.IsEIP158 {
 			// if empty and transfers value
-			if evm.StateDB.Empty(address) && evm.StateDB.GetBalance(contract.Address()).Sign() != 0 {
-				gas += params.CreateBySelfdestructGas
+			if evm.StateDB.Empty(address) {
+				if evm.StateDB.GetBalance(contract.Address()).Sign() != 0 {
+					gas += params.CreateBySelfdestructGas
+					if evm.Config.EnableRedo {
+						evm.RedoContext.AppendAssertBalanceNonZeroLog(contract.Address())
+					}
+				} else {
+					if evm.Config.EnableRedo {
+						evm.RedoContext.AppendAssertBalanceZeroLog(contract.Address())
+					}
+				}
 			}
 		} else if !evm.StateDB.Exist(address) {
 			gas += params.CreateBySelfdestructGas

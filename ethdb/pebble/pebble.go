@@ -589,7 +589,7 @@ func (b *batch) Reset() {
 func (b *batch) Replay(w ethdb.KeyValueWriter) error {
 	reader := b.b.Reader()
 	for {
-		kind, k, v, ok := reader.Next()
+		kind, k, v, ok, _ := reader.Next()
 		if !ok {
 			break
 		}
@@ -626,6 +626,41 @@ func (d *Database) NewIterator(prefix []byte, start []byte) ethdb.Iterator {
 	})
 	iter.First()
 	return &pebbleIterator{iter: iter, moved: true, released: false}
+}
+
+func (d *Database) Scan(start, end []byte, limit int, reverse bool) (keys [][]byte, values [][]byte, err error) {
+	iter, err := d.db.NewIter(&pebble.IterOptions{
+		LowerBound: start,
+		UpperBound: end,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	defer iter.Close()
+	keys = make([][]byte, 0)
+	values = make([][]byte, 0)
+	var ok bool
+	if reverse {
+		ok = iter.Last()
+	} else {
+		ok = iter.First()
+	}
+	for i := 0; i < limit && ok; i++ {
+		key := iter.Key()
+		val := iter.Value()
+		newKey := make([]byte, len(key))
+		newVal := make([]byte, len(val))
+		copy(newKey, key)
+		copy(newVal, val)
+		keys = append(keys, newKey)
+		values = append(values, newVal)
+		if reverse {
+			ok = iter.Prev()
+		} else {
+			ok = iter.Next()
+		}
+	}
+	return
 }
 
 // Next moves the iterator to the next key/value pair. It returns whether the

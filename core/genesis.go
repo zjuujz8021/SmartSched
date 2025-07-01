@@ -32,6 +32,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/ethdb/pebble"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -112,6 +113,8 @@ func ReadGenesis(db ethdb.Database) (*Genesis, error) {
 	return &genesis, nil
 }
 
+var PebbleDb *pebble.Database
+
 // hashAlloc computes the state root according to the genesis specification.
 func hashAlloc(ga *types.GenesisAlloc, isVerkle bool) (common.Hash, error) {
 	// If a genesis-time verkle trie is requested, create a trie config
@@ -141,7 +144,10 @@ func hashAlloc(ga *types.GenesisAlloc, isVerkle bool) (common.Hash, error) {
 			statedb.SetState(addr, key, value)
 		}
 	}
-	return statedb.Commit(0, false)
+
+	root, err := statedb.Commit(0, false)
+
+	return root, err
 }
 
 // flushAlloc is very similar with hash, but the main difference is all the generated

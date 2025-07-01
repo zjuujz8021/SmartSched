@@ -52,6 +52,7 @@ import (
 	"github.com/ethereum/go-ethereum/eth/gasprice"
 	"github.com/ethereum/go-ethereum/eth/tracers"
 	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/ethdb/pebble"
 	"github.com/ethereum/go-ethereum/ethdb/remotedb"
 	"github.com/ethereum/go-ethereum/ethstats"
 	"github.com/ethereum/go-ethereum/graphql"
@@ -83,6 +84,25 @@ import (
 //
 // The flags are defined here so their names and help texts
 // are the same for all commands.
+
+var (
+	ThreadsFlag = &cli.IntFlag{
+		Name:  "threads",
+		Value: 8,
+	}
+	ExecStatsFileFlag = &cli.StringFlag{
+		Name:  "exec.stats.file",
+		Value: "./results/logs/benchmark.log",
+	}
+	OnlySmartSchedsFlag = &cli.BoolFlag{
+		Name:  "only.smartscheds",
+		Value: false,
+	}
+	AllSchemesFlag = &cli.BoolFlag{
+		Name:  "all.schemes",
+		Value: false,
+	}
+)
 
 var (
 	// General settings
@@ -2121,11 +2141,14 @@ func MakeChain(ctx *cli.Context, stack *node.Node, readonly bool) (*core.BlockCh
 	}
 	vmcfg := vm.Config{EnablePreimageRecording: ctx.Bool(VMEnableDebugFlag.Name)}
 
+	archiveDb := MakeArchive(ctx, stack)
+
 	// Disable transaction indexing/unindexing by default.
 	chain, err := core.NewBlockChain(chainDb, cache, gspec, nil, engine, vmcfg, nil, nil)
 	if err != nil {
 		Fatalf("Can't create BlockChain: %v", err)
 	}
+	chain.SetSlimArchiveDb(archiveDb)
 	return chain, chainDb
 }
 
@@ -2168,4 +2191,21 @@ func MakeTrieDatabase(ctx *cli.Context, disk ethdb.Database, preimage bool, read
 		config.PathDB = pathdb.Defaults
 	}
 	return triedb.NewDatabase(disk, config)
+}
+
+func MakeArchive(ctx *cli.Context, stack *node.Node) *pebble.Database {
+	var (
+		cache   = ctx.Int(CacheFlag.Name) * ctx.Int(CacheDatabaseFlag.Name) / 100
+		handles = MakeDatabaseHandles(ctx.Int(FDLimitFlag.Name))
+
+		err     error
+		archive *pebble.Database
+	)
+
+	// archive, err = leveldb.New(stack.ResolvePath("archive"), cache, handles, "", false)
+	archive, err = pebble.New(stack.ResolvePath("archive"), cache, handles, "", false, false)
+	if err != nil {
+		Fatalf("Could not open database: %v", err)
+	}
+	return archive
 }

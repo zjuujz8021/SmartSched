@@ -18,6 +18,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -35,6 +36,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/ethdb/pebble"
 	"github.com/ethereum/go-ethereum/internal/flags"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/trie"
@@ -79,7 +81,20 @@ Remove blockchain and state databases`,
 			dbExportCmd,
 			dbMetadataCmd,
 			dbCheckStateContentCmd,
+			dbMoveCmd,
 		},
+	}
+	dbMoveCmd = &cli.Command{
+		Action: dbMove,
+		Name:   "move",
+		Flags: flags.Merge([]cli.Flag{
+			&cli.StringFlag{
+				Name: "src",
+			},
+			&cli.StringFlag{
+				Name: "dst",
+			},
+		}),
 	}
 	dbInspectCmd = &cli.Command{
 		Action:    inspect,
@@ -757,5 +772,61 @@ func showMetaData(ctx *cli.Context) error {
 	table.SetHeader([]string{"Field", "Value"})
 	table.AppendBulk(data)
 	table.Render()
+	return nil
+}
+
+func dbMove(ctx *cli.Context) error {
+	src, dst := ctx.String("src"), ctx.String("dst")
+	if src == "" || dst == "" {
+		return errors.New("invalid path")
+	}
+	srcDb, err := pebble.New(src, 8192, 65536, "", false, false)
+	if err != nil {
+		panic(err)
+	}
+	defer srcDb.Close()
+	dstDb, err := pebble.New(dst, 8192, 65536, "", false, false)
+	if err != nil {
+		panic(err)
+	}
+	defer dstDb.Close()
+
+	type Pair struct {
+		k []byte
+		v []byte
+	}
+	taskCh := make(chan *Pair, 100000)
+	b := dstDb.NewBatch()
+
+	go func() {
+		var cnt uint64
+		it := srcDb.NewIterator(nil, nil)
+		for it.Next() {
+			key := it.Key()
+			taskCh <- &Pair{
+				k: bytes.Clone(key),
+				v: bytes.Clone(it.Value()),
+			}
+			if cnt%1000000 == 0 {
+				log.Info("stats", "current path", hexutil.Encode(key), "cnt", cnt)
+			}
+			cnt++
+		}
+		it.Release()
+		close(taskCh)
+	}()
+
+	for pair := range taskCh {
+		b.Put(pair.k, pair.v)
+		if b.ValueSize() >= ethdb.IdealBatchSize {
+			if err := b.Write(); err != nil {
+				log.Error("Failed to write data", "err", err)
+			}
+			b.Reset()
+		}
+	}
+	if err := b.Write(); err != nil {
+		log.Error("Failed to write data", "err", err)
+	}
 	return nil
 }

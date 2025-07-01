@@ -29,6 +29,9 @@ type journalEntry interface {
 
 	// dirtied returns the Ethereum address modified by this journal entry.
 	dirtied() *common.Address
+
+	// merge recovers the previous state before current transaction in journal.
+	merge(j *journal)
 }
 
 // journal contains the list of state modifications applied since the last state
@@ -37,6 +40,14 @@ type journalEntry interface {
 type journal struct {
 	entries []journalEntry         // Current changes tracked by the journal
 	dirties map[common.Address]int // Dirty accounts and the number of changes
+
+	// SlimArchive
+	prevBalance  map[common.Address]*uint256.Int
+	prevCodeHash map[common.Address][]byte
+	prevNonce    map[common.Address]uint64
+	prevState    map[common.Address]map[common.Hash]common.Hash
+	created      map[common.Address]struct{}
+	reset        map[common.Address]struct{}
 }
 
 // newJournal creates a new initialized journal.
@@ -81,6 +92,55 @@ func (j *journal) dirty(addr common.Address) {
 // length returns the current number of entries in the journal.
 func (j *journal) length() int {
 	return len(j.entries)
+}
+
+// mergePrev recovers all previous state before current transaction.
+func (j *journal) mergePrev() {
+	j.prevBalance = make(map[common.Address]*uint256.Int, j.length())
+	j.prevCodeHash = make(map[common.Address][]byte, j.length())
+	j.prevNonce = make(map[common.Address]uint64, j.length())
+	j.prevState = make(map[common.Address]map[common.Hash]common.Hash, j.length())
+	j.created = make(map[common.Address]struct{}, j.length())
+	j.reset = make(map[common.Address]struct{}, j.length())
+
+	for _, entry := range j.entries {
+		entry.merge(j)
+	}
+}
+
+func (j *journal) PrevBalance(addr common.Address) *uint256.Int {
+	return j.prevBalance[addr]
+}
+
+func (j *journal) PrevCodeHash(addr common.Address) []byte {
+	return j.prevCodeHash[addr]
+}
+
+func (j *journal) PrevNonce(addr common.Address) *uint64 {
+	if nonce, ok := j.prevNonce[addr]; ok {
+		return &nonce
+	} else {
+		return nil
+	}
+}
+
+func (j *journal) PrevState(addr common.Address, key common.Hash) *common.Hash {
+	if storage, ok := j.prevState[addr]; ok {
+		if state, ok := storage[key]; ok {
+			return &state
+		}
+	}
+	return nil
+}
+
+func (j *journal) Created(addr common.Address) bool {
+	_, ok := j.created[addr]
+	return ok
+}
+
+func (j *journal) Reset(addr common.Address) bool {
+	_, ok := j.reset[addr]
+	return ok
 }
 
 type (
@@ -160,6 +220,10 @@ func (ch createObjectChange) dirtied() *common.Address {
 	return ch.account
 }
 
+func (ch createObjectChange) merge(j *journal) {
+	j.created[*ch.account] = struct{}{}
+}
+
 func (ch resetObjectChange) revert(s *StateDB) {
 	s.setStateObject(ch.prev)
 	if !ch.prevdestruct {
@@ -183,6 +247,10 @@ func (ch resetObjectChange) dirtied() *common.Address {
 	return ch.account
 }
 
+func (ch resetObjectChange) merge(j *journal) {
+	j.reset[ch.prev.address] = struct{}{}
+}
+
 func (ch selfDestructChange) revert(s *StateDB) {
 	obj := s.getStateObject(*ch.account)
 	if obj != nil {
@@ -195,6 +263,12 @@ func (ch selfDestructChange) dirtied() *common.Address {
 	return ch.account
 }
 
+func (ch selfDestructChange) merge(j *journal) {
+	if _, ok := j.prevBalance[*ch.account]; !ok {
+		j.prevBalance[*ch.account] = ch.prevbalance
+	}
+}
+
 var ripemd = common.HexToAddress("0000000000000000000000000000000000000003")
 
 func (ch touchChange) revert(s *StateDB) {
@@ -202,6 +276,9 @@ func (ch touchChange) revert(s *StateDB) {
 
 func (ch touchChange) dirtied() *common.Address {
 	return ch.account
+}
+
+func (ch touchChange) merge(j *journal) {
 }
 
 func (ch balanceChange) revert(s *StateDB) {
@@ -212,12 +289,24 @@ func (ch balanceChange) dirtied() *common.Address {
 	return ch.account
 }
 
+func (ch balanceChange) merge(j *journal) {
+	if _, ok := j.prevBalance[*ch.account]; !ok {
+		j.prevBalance[*ch.account] = ch.prev
+	}
+}
+
 func (ch nonceChange) revert(s *StateDB) {
 	s.getStateObject(*ch.account).setNonce(ch.prev)
 }
 
 func (ch nonceChange) dirtied() *common.Address {
 	return ch.account
+}
+
+func (ch nonceChange) merge(j *journal) {
+	if _, ok := j.prevNonce[*ch.account]; !ok {
+		j.prevNonce[*ch.account] = ch.prev
+	}
 }
 
 func (ch codeChange) revert(s *StateDB) {
@@ -228,12 +317,27 @@ func (ch codeChange) dirtied() *common.Address {
 	return ch.account
 }
 
+func (ch codeChange) merge(j *journal) {
+	if _, ok := j.prevCodeHash[*ch.account]; !ok {
+		j.prevCodeHash[*ch.account] = ch.prevhash
+	}
+}
+
 func (ch storageChange) revert(s *StateDB) {
 	s.getStateObject(*ch.account).setState(ch.key, ch.prevalue)
 }
 
 func (ch storageChange) dirtied() *common.Address {
 	return ch.account
+}
+
+func (ch storageChange) merge(j *journal) {
+	if _, ok := j.prevState[*ch.account]; !ok {
+		j.prevState[*ch.account] = make(map[common.Hash]common.Hash)
+	}
+	if _, ok := j.prevState[*ch.account][ch.key]; !ok {
+		j.prevState[*ch.account][ch.key] = ch.prevalue
+	}
 }
 
 func (ch transientStorageChange) revert(s *StateDB) {
@@ -244,12 +348,18 @@ func (ch transientStorageChange) dirtied() *common.Address {
 	return nil
 }
 
+func (ch transientStorageChange) merge(j *journal) {
+}
+
 func (ch refundChange) revert(s *StateDB) {
 	s.refund = ch.prev
 }
 
 func (ch refundChange) dirtied() *common.Address {
 	return nil
+}
+
+func (ch refundChange) merge(j *journal) {
 }
 
 func (ch addLogChange) revert(s *StateDB) {
@@ -266,12 +376,18 @@ func (ch addLogChange) dirtied() *common.Address {
 	return nil
 }
 
+func (ch addLogChange) merge(j *journal) {
+}
+
 func (ch addPreimageChange) revert(s *StateDB) {
 	delete(s.preimages, ch.hash)
 }
 
 func (ch addPreimageChange) dirtied() *common.Address {
 	return nil
+}
+
+func (ch addPreimageChange) merge(j *journal) {
 }
 
 func (ch accessListAddAccountChange) revert(s *StateDB) {
@@ -291,10 +407,16 @@ func (ch accessListAddAccountChange) dirtied() *common.Address {
 	return nil
 }
 
+func (ch accessListAddAccountChange) merge(j *journal) {
+}
+
 func (ch accessListAddSlotChange) revert(s *StateDB) {
 	s.accessList.DeleteSlot(*ch.address, *ch.slot)
 }
 
 func (ch accessListAddSlotChange) dirtied() *common.Address {
 	return nil
+}
+
+func (ch accessListAddSlotChange) merge(j *journal) {
 }

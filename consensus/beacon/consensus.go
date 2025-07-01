@@ -361,6 +361,8 @@ func (beacon *Beacon) Finalize(chain consensus.ChainHeaderReader, header *types.
 		state.AddBalance(w.Address, amount)
 	}
 	// No block reward which is issued by consensus layer instead.
+
+	state.FinaliseTransfer()
 }
 
 // FinalizeAndAssemble implements consensus.Engine, setting the final state and

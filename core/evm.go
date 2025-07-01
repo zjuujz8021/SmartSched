@@ -18,6 +18,7 @@ package core
 
 import (
 	"math/big"
+	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
@@ -89,13 +90,30 @@ func NewEVMTxContext(msg *Message) vm.TxContext {
 	return ctx
 }
 
+func NewEVMTxContextWithIndex(msg *Message, txIndex int) vm.TxContext {
+	ctx := vm.TxContext{
+		Origin:     msg.From,
+		GasPrice:   new(big.Int).Set(msg.GasPrice),
+		BlobHashes: msg.BlobHashes,
+
+		TxIndex: txIndex,
+	}
+	if msg.BlobGasFeeCap != nil {
+		ctx.BlobFeeCap = new(big.Int).Set(msg.BlobGasFeeCap)
+	}
+	return ctx
+}
+
 // GetHashFn returns a GetHashFunc which retrieves header hashes by number
 func GetHashFn(ref *types.Header, chain ChainContext) func(n uint64) common.Hash {
 	// Cache will initially contain [refHash.parent],
 	// Then fill up with [refHash.p, refHash.pp, refHash.ppp, ...]
 	var cache []common.Hash
+	var lock sync.Mutex
 
 	return func(n uint64) common.Hash {
+		lock.Lock()
+		defer lock.Unlock()
 		if ref.Number.Uint64() <= n {
 			// This situation can happen if we're doing tracing and using
 			// block overrides.

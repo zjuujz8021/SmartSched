@@ -41,6 +41,7 @@ var (
 	// errStopToken is an internal token indicating interpreter loop termination,
 	// never returned to outside callers.
 	errStopToken = errors.New("stop token")
+	ErrAbort     = errors.New("aborted")
 )
 
 // ErrStackUnderflow wraps an evm error when the items on the stack less

@@ -196,6 +196,11 @@ func enable1153(jt *JumpTable) {
 // opTload implements TLOAD opcode
 func opTload(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
 	loc := scope.Stack.peek()
+	loc_tag := scope.Stack.peekTag()
+	if interpreter.evm.Config.EnableRedo {
+		interpreter.evm.RedoContext.OperationLogs.AppendAssertion(*loc_tag, *loc)
+		*loc_tag = 0
+	}
 	hash := common.Hash(loc.Bytes32())
 	val := interpreter.evm.StateDB.GetTransientState(scope.Contract.Address(), hash)
 	loc.SetBytes(val.Bytes())
@@ -209,6 +214,12 @@ func opTstore(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]b
 	}
 	loc := scope.Stack.pop()
 	val := scope.Stack.pop()
+	loc_tag := scope.Stack.popTag()
+	val_tag := scope.Stack.popTag()
+	if interpreter.evm.Config.EnableRedo {
+		interpreter.evm.RedoContext.OperationLogs.AppendAssertion(loc_tag, loc)
+		interpreter.evm.RedoContext.OperationLogs.AppendAssertion(val_tag, val)
+	}
 	interpreter.evm.StateDB.SetTransientState(scope.Contract.Address(), loc.Bytes32(), val.Bytes32())
 	return nil, nil
 }
@@ -263,7 +274,16 @@ func opMcopy(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]by
 		dst    = scope.Stack.pop()
 		src    = scope.Stack.pop()
 		length = scope.Stack.pop()
+
+		dstTag    = scope.Stack.popTag()
+		srcTag    = scope.Stack.popTag()
+		lengthTag = scope.Stack.popTag()
 	)
+	if interpreter.evm.Config.EnableRedo {
+		interpreter.evm.RedoContext.OperationLogs.AppendAssertion(dstTag, dst)
+		interpreter.evm.RedoContext.OperationLogs.AppendAssertion(srcTag, src)
+		interpreter.evm.RedoContext.OperationLogs.AppendAssertion(lengthTag, length)
+	}
 	// These values are checked for overflow during memory expansion calculation
 	// (the memorySize function on the opcode).
 	scope.Memory.Copy(dst.Uint64(), src.Uint64(), length.Uint64())
@@ -273,6 +293,11 @@ func opMcopy(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]by
 // opBlobHash implements the BLOBHASH opcode
 func opBlobHash(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
 	index := scope.Stack.peek()
+	index_tag := scope.Stack.peekTag()
+	if interpreter.evm.Config.EnableRedo {
+		interpreter.evm.RedoContext.OperationLogs.AppendAssertion(*index_tag, *index)
+		*index_tag = 0
+	}
 	if index.LtUint64(uint64(len(interpreter.evm.TxContext.BlobHashes))) {
 		blobHash := interpreter.evm.TxContext.BlobHashes[index.Uint64()]
 		index.SetBytes32(blobHash[:])

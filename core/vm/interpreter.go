@@ -29,6 +29,8 @@ type Config struct {
 	NoBaseFee               bool      // Forces the EIP-1559 baseFee to 0 (needed for 0 price calls)
 	EnablePreimageRecording bool      // Enables recording of SHA3/keccak preimages
 	ExtraEips               []int     // Additional EIPS that are to be enabled
+
+	EnableRedo bool // Enables redo for ParallelEVM
 }
 
 // ScopeContext contains the things that are per-call, such as stack and memory,
@@ -49,6 +51,8 @@ type EVMInterpreter struct {
 
 	readOnly   bool   // Whether to throw on stateful modifications
 	returnData []byte // Last CALL's return data for subsequent reuse
+
+	sstoreCb func(tx int, pc uint64, addr common.Address, key, value common.Hash)
 }
 
 // NewEVMInterpreter returns a new instance of the Interpreter.
@@ -170,6 +174,9 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 	// the execution of one of the operations or until the done flag is set by the
 	// parent context.
 	for {
+		if in.evm.Cancelled() {
+			return nil, ErrAbort
+		}
 		if debug {
 			// Capture pre-execution values for tracing.
 			logged, pcCopy, gasCopy = false, pc, contract.Gas

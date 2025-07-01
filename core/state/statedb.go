@@ -20,6 +20,7 @@ package state
 import (
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -79,6 +80,7 @@ type StateDB struct {
 
 	// This map holds 'live' objects, which will get modified while processing
 	// a state transition.
+	stateObjMu           sync.RWMutex
 	stateObjects         map[common.Address]*stateObject
 	stateObjectsPending  map[common.Address]struct{}            // State objects finalized but not yet written to the trie
 	stateObjectsDirty    map[common.Address]struct{}            // State objects modified in the current execution
@@ -92,6 +94,8 @@ type StateDB struct {
 	// by all cached state objects in case the database failure occurs
 	// when accessing state of accounts.
 	dbErr error
+
+	errMu sync.RWMutex
 
 	// The refund counter, also used by state transitioning.
 	refund uint64
@@ -138,6 +142,8 @@ type StateDB struct {
 
 	// Testing hooks
 	onCommit func(states *triestate.Set) // Hook invoked when commit is performed
+
+	BlockSTMTrie *BlockSTMTrie
 }
 
 // New creates a new state from a given trie.
@@ -169,6 +175,9 @@ func New(root common.Hash, db Database, snaps *snapshot.Tree) (*StateDB, error) 
 	if sdb.snaps != nil {
 		sdb.snap = sdb.snaps.Snapshot(root)
 	}
+	if stmtrie, ok := db.(*BlockSTMTrie); ok {
+		sdb.BlockSTMTrie = stmtrie
+	}
 	return sdb, nil
 }
 
@@ -196,6 +205,8 @@ func (s *StateDB) StopPrefetcher() {
 
 // setError remembers the first non-nil error it is called with.
 func (s *StateDB) setError(err error) {
+	s.errMu.Lock()
+	defer s.errMu.Unlock()
 	if s.dbErr == nil {
 		s.dbErr = err
 	}
@@ -203,6 +214,8 @@ func (s *StateDB) setError(err error) {
 
 // Error returns the memorized database failure occurred earlier.
 func (s *StateDB) Error() error {
+	s.errMu.RLock()
+	defer s.errMu.RUnlock()
 	return s.dbErr
 }
 
@@ -553,15 +566,35 @@ func (s *StateDB) getStateObject(addr common.Address) *stateObject {
 	return nil
 }
 
+func (s *StateDB) GetStateObject(addr common.Address) *stateObject {
+	return s.getStateObject(addr)
+}
+
+func (s *StateDB) GetCommittedStateObjecFromTrie(addr common.Address) *stateObject {
+	var err error
+	data, err := s.trie.GetAccount(addr)
+	if err != nil {
+		s.setError(fmt.Errorf("GetCommittedStateObjecFromTrie (%x) error: %w", addr.Bytes(), err))
+		return nil
+	}
+	if data == nil {
+		return nil
+	}
+	return newObject(s, addr, data)
+}
+
 // getDeletedStateObject is similar to getStateObject, but instead of returning
 // nil for a deleted state object, it returns the actual object with the deleted
 // flag set. This is needed by the state journal to revert to the correct s-
 // destructed object instead of wiping all knowledge about the state object.
 func (s *StateDB) getDeletedStateObject(addr common.Address) *stateObject {
 	// Prefer live objects if any is available
+	s.stateObjMu.RLock()
 	if obj := s.stateObjects[addr]; obj != nil {
+		s.stateObjMu.RUnlock()
 		return obj
 	}
+	s.stateObjMu.RUnlock()
 	// If no live objects are available, attempt to use snapshots
 	var data *types.StateAccount
 	if s.snap != nil {
@@ -611,7 +644,9 @@ func (s *StateDB) getDeletedStateObject(addr common.Address) *stateObject {
 }
 
 func (s *StateDB) setStateObject(object *stateObject) {
+	s.stateObjMu.Lock()
 	s.stateObjects[object.Address()] = object
+	s.stateObjMu.Unlock()
 }
 
 // getOrNewStateObject retrieves a state object or create a new state object if nil.
@@ -815,10 +850,36 @@ func (s *StateDB) GetRefund() uint64 {
 	return s.refund
 }
 
+func (s *StateDB) WriteToSTMStore(deleteEmptyObjects bool) {
+	for addr := range s.journal.dirties {
+		obj, exist := s.stateObjects[addr]
+		if !exist {
+			continue
+		}
+		if obj.selfDestructed || (deleteEmptyObjects && obj.empty()) {
+			s.BlockSTMTrie.DeleteAccount(obj.address)
+		} else {
+			s.BlockSTMTrie.UpdateAccountWithOrigin(obj.address, &obj.data, obj.origin)
+			if obj.dirtyCode {
+				s.BlockSTMTrie.UpdateContractCode(obj.address, common.BytesToHash(obj.data.CodeHash), obj.code)
+			}
+			for key, value := range obj.dirtyStorage {
+				if value == obj.GetCommittedState(key) {
+					continue
+				}
+				s.BlockSTMTrie.UpdateStorage(obj.address, key[:], value[:])
+			}
+		}
+	}
+}
+
 // Finalise finalises the state by removing the destructed objects and clears
 // the journal as well as the refunds. Finalise, however, will not push any updates
 // into the tries just yet. Only IntermediateRoot or Commit will do that.
 func (s *StateDB) Finalise(deleteEmptyObjects bool) {
+	// SlimArchive
+	s.journal.mergePrev()
+
 	addressesToPrefetch := make([][]byte, 0, len(s.journal.dirties))
 	for addr := range s.journal.dirties {
 		obj, exist := s.stateObjects[addr]
@@ -864,6 +925,9 @@ func (s *StateDB) Finalise(deleteEmptyObjects bool) {
 	}
 	// Invalidate journal because reverting across transactions is not allowed.
 	s.clearJournalAndRefund()
+}
+
+func (s *StateDB) FinaliseTransfer() {
 }
 
 // IntermediateRoot computes the current root hash of the state trie.
